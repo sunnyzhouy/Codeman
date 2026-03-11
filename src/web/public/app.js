@@ -758,40 +758,73 @@ class CodemanApp {
     const MIN_ROWS = 10;
 
     const throttledResize = () => {
-      if (this._resizeTimeout) return;
+      // Trailing-edge debounce: ALL resize work (fit + clear + SIGWINCH) happens
+      // once after the user stops resizing. During active resize, the terminal
+      // stays at its old dimensions for up to 300ms.
+      //
+      // Why not fit() immediately? Each fitAddon.fit() reflows content at the
+      // new width — lines that were 7 rows become 10, and the overflow gets
+      // pushed into scrollback. With continuous resize events, this creates
+      // dozens of intermediate reflow states in scrollback, appearing as
+      // duplicate/garbled content when the user scrolls up.
+      //
+      // By deferring fit() to the trailing edge, there's exactly ONE reflow
+      // at the final dimensions, ONE viewport clear, and ONE Ink redraw.
+      if (this._resizeTimeout) {
+        clearTimeout(this._resizeTimeout);
+      }
       this._resizeTimeout = setTimeout(() => {
         this._resizeTimeout = null;
+        // Fit xterm.js to final container dimensions
         if (this.fitAddon) {
           this.fitAddon.fit();
-          // Skip server resize while mobile keyboard is visible — sending SIGWINCH
-          // causes Ink to re-render at the new row count, garbling terminal output.
-          // Local fit() still runs so xterm knows the viewport size for scrolling.
-          const keyboardUp = typeof KeyboardHandler !== 'undefined' && KeyboardHandler.keyboardVisible;
-          if (this.activeSessionId && !keyboardUp) {
-            const dims = this.fitAddon.proposeDimensions();
-            // Enforce minimum dimensions to prevent layout issues
-            const cols = dims ? Math.max(dims.cols, MIN_COLS) : MIN_COLS;
-            const rows = dims ? Math.max(dims.rows, MIN_ROWS) : MIN_ROWS;
-            // Only send resize if dimensions actually changed
-            if (!this._lastResizeDims ||
-                cols !== this._lastResizeDims.cols ||
-                rows !== this._lastResizeDims.rows) {
-              this._lastResizeDims = { cols, rows };
-              fetch(`/api/sessions/${this.activeSessionId}/resize`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cols, rows })
-              }).catch(() => {});
-            }
+        }
+        // Flush any stale flicker buffer before clearing viewport
+        if (this.flickerFilterBuffer) {
+          if (this.flickerFilterTimeout) {
+            clearTimeout(this.flickerFilterTimeout);
+            this.flickerFilterTimeout = null;
+          }
+          this.flushFlickerBuffer();
+        }
+        // Clear viewport + scrollback for Ink-based sessions before sending SIGWINCH.
+        // fitAddon.fit() reflows content: lines at old width may wrap to more rows,
+        // pushing overflow into scrollback. Ink's cursor-up count is based on the
+        // pre-reflow line count, so ghost renders accumulate in scrollback.
+        // Fix: \x1b[3J (Erase Saved Lines) clears scrollback reflow debris,
+        // then \x1b[H\x1b[2J clears the viewport for a clean Ink redraw.
+        const activeResizeSession = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
+        if (activeResizeSession && activeResizeSession.mode !== 'shell' && !activeResizeSession._ended
+            && this.terminal && this.isTerminalAtBottom()) {
+          this.terminal.write('\x1b[3J\x1b[H\x1b[2J');
+        }
+        // Skip server resize while mobile keyboard is visible — sending SIGWINCH
+        // causes Ink to re-render at the new row count, garbling terminal output.
+        // Local fit() still runs so xterm knows the viewport size for scrolling.
+        const keyboardUp = typeof KeyboardHandler !== 'undefined' && KeyboardHandler.keyboardVisible;
+        if (this.activeSessionId && !keyboardUp) {
+          const dims = this.fitAddon.proposeDimensions();
+          // Enforce minimum dimensions to prevent layout issues
+          const cols = dims ? Math.max(dims.cols, MIN_COLS) : MIN_COLS;
+          const rows = dims ? Math.max(dims.rows, MIN_ROWS) : MIN_ROWS;
+          // Only send resize if dimensions actually changed
+          if (!this._lastResizeDims ||
+              cols !== this._lastResizeDims.cols ||
+              rows !== this._lastResizeDims.rows) {
+            this._lastResizeDims = { cols, rows };
+            fetch(`/api/sessions/${this.activeSessionId}/resize`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ cols, rows })
+            }).catch(() => {});
           }
         }
-        // Update subagent connection lines when viewport resizes
+        // Update subagent connection lines and local echo at new dimensions
         this.updateConnectionLines();
-        // Re-render local echo overlay at new cell dimensions/positions
         if (this._localEchoOverlay?.hasPending) {
           this._localEchoOverlay.rerender();
         }
-      }, 100); // Throttle to 100ms
+      }, 300); // Trailing-edge: only fire after 300ms of no resize events
     };
 
     window.addEventListener('resize', throttledResize);
@@ -1293,56 +1326,13 @@ class CodemanApp {
     const session = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
     const flickerFilterEnabled = session?.flickerFilterEnabled ?? false;
 
-    // Always buffer Ink's cursor-up redraws regardless of flicker filter setting.
-    // Ink's status bar updates use cursor-up + erase-line + rewrite, which can split
-    // across render frames causing old/new status text to overlap (garbled output).
-    // Buffering for 50ms ensures the full redraw arrives atomically.
-    //
-    // Shell mode is excluded: shell readline also uses cursor-up for prompt redraws
-    // (e.g. zsh syntax highlighting on every keystroke), and there's no Ink status bar
-    // to protect. Applying the filter in shell mode delays character feedback until the
-    // user stops typing for 50ms, making the terminal feel unresponsive.
-    const isShellMode = session?.mode === 'shell';
-    const hasCursorUpRedraw = !isShellMode && /\x1b\[\d{1,2}A/.test(data);
-    if (hasCursorUpRedraw || (this.flickerFilterActive && !flickerFilterEnabled)) {
-      this.flickerFilterActive = true;
-      this.flickerFilterBuffer += data;
+    // xterm.js 6.0 handles DEC 2026 synchronized output natively — Ink's cursor-up
+    // redraws are wrapped in 2026h/2026l markers and rendered atomically by xterm.js.
+    // No client-side cursor-up detection/buffering needed. The old 50ms flicker filter
+    // was actively harmful: it accumulated multiple resize redraws and flushed them
+    // together, causing stacked ghost renders due to reflow line-count mismatches.
 
-      // Only reset the 50ms timer on cursor-up events (start of a new Ink redraw cycle).
-      // Non-cursor-up events while the filter is active are trailing data from the same
-      // redraw — don't extend the deadline further. Without this guard, a busy Claude
-      // session emitting terminal data faster than SYNC_WAIT_TIMEOUT_MS never flushes,
-      // accumulating MBs in flickerFilterBuffer that freeze Chrome all at once.
-      if (hasCursorUpRedraw) {
-        if (this.flickerFilterTimeout) {
-          clearTimeout(this.flickerFilterTimeout);
-        }
-        this.flickerFilterTimeout = setTimeout(() => {
-          this.flickerFilterTimeout = null;
-          this.flushFlickerBuffer();
-        }, SYNC_WAIT_TIMEOUT_MS); // 50ms buffer window
-      } else if (!this.flickerFilterTimeout) {
-        // Safety: if no timer is running for some reason, ensure we eventually flush.
-        this.flickerFilterTimeout = setTimeout(() => {
-          this.flickerFilterTimeout = null;
-          this.flushFlickerBuffer();
-        }, SYNC_WAIT_TIMEOUT_MS);
-      }
-
-      // Safety valve: if buffer grew very large (e.g. from a burst before the timer fired),
-      // flush immediately to avoid writing a huge block all at once.
-      if (this.flickerFilterBuffer.length > 256 * 1024) {
-        if (this.flickerFilterTimeout) {
-          clearTimeout(this.flickerFilterTimeout);
-          this.flickerFilterTimeout = null;
-        }
-        this.flushFlickerBuffer();
-      }
-
-      return;
-    }
-
-    // Opt-in flicker filter: also buffer screen clear patterns
+    // Opt-in flicker filter: buffer screen clear patterns (for sessions that enable it)
     if (flickerFilterEnabled) {
       const hasScreenClear = data.includes('\x1b[2J') ||
                              data.includes('\x1b[H\x1b[J') ||
@@ -1375,34 +1365,10 @@ class CodemanApp {
     if (!this.writeFrameScheduled) {
       this.writeFrameScheduled = true;
       requestAnimationFrame(() => {
-        if (this.pendingWrites.length > 0 && this.terminal) {
-          // Join chunks for sync marker detection
-          const pending = this.pendingWrites.join('');
-          // Check if we have an incomplete sync block (SYNC_START without SYNC_END)
-          const hasStart = pending.includes(DEC_SYNC_START);
-          const hasEnd = pending.includes(DEC_SYNC_END);
-
-          if (hasStart && !hasEnd) {
-            // Incomplete sync block - wait for more data (up to 50ms max)
-            if (!this.syncWaitTimeout) {
-              this.syncWaitTimeout = setTimeout(() => {
-                this.syncWaitTimeout = null;
-                // Force flush after timeout to prevent stuck state
-                this.flushPendingWrites();
-              }, 50);
-            }
-            this.writeFrameScheduled = false;
-            return;
-          }
-
-          // Clear any pending sync wait timeout
-          if (this.syncWaitTimeout) {
-            clearTimeout(this.syncWaitTimeout);
-            this.syncWaitTimeout = null;
-          }
-
-          this.flushPendingWrites();
-        }
+        // xterm.js 6.0 handles DEC 2026 sync markers natively — it buffers
+        // content between 2026h/2026l and renders atomically. No need for
+        // client-side incomplete-block detection; just flush every frame.
+        this.flushPendingWrites();
         this.writeFrameScheduled = false;
       });
     }
@@ -1487,57 +1453,35 @@ class CodemanApp {
     if (this.pendingWrites.length === 0 || !this.terminal) return;
 
     const _t0 = performance.now();
-    // Extract segments, stripping DEC 2026 markers
-    // This implements synchronized output for xterm.js which doesn't support DEC 2026 natively
-    const _joinedLen = this.pendingWrites.reduce((s, w) => s + w.length, 0);
-    if (_joinedLen > 16384) _crashDiag.log(`FLUSH: ${(_joinedLen/1024).toFixed(0)}KB`);
+    // xterm.js 6.0+ natively handles DEC 2026 synchronized output markers.
+    // Pass raw data through — xterm.js buffers content between markers and
+    // renders atomically, eliminating split-frame Ink redraws.
     const joined = this.pendingWrites.join('');
     this.pendingWrites = [];
+    const _joinedLen = joined.length;
+    if (_joinedLen > 16384) _crashDiag.log(`FLUSH: ${(_joinedLen/1024).toFixed(0)}KB`);
 
-    const segments = extractSyncSegments(joined);
-
-    // Write segments respecting a per-frame byte budget.
-    // Each DEC 2026 sync segment is a complete Ink redraw — writing whole segments
-    // preserves atomicity (no flicker). But when total data exceeds 48KB, defer
-    // remaining segments to the next frame to prevent terminal.write() from blocking
-    // the main thread. 141KB single-frame writes have been observed to freeze Chrome
-    // for 2+ minutes even with the canvas renderer.
+    // Per-frame byte budget to prevent main thread blocking.
+    // Large writes (141KB+) can freeze Chrome for 2+ minutes.
     const MAX_FRAME_BYTES = 65536; // 64KB budget per frame
-    let bytesThisFrame = 0;
     let deferred = false;
 
-    for (let i = 0; i < segments.length; i++) {
-      const segment = segments[i];
-      if (!segment) continue;
-      const content = segment.startsWith(DEC_SYNC_START)
-        ? segment.slice(DEC_SYNC_START.length)
-        : segment;
-      if (!content) continue;
-
-      // If we'd exceed the budget, defer this and all remaining segments
-      if (bytesThisFrame > 0 && bytesThisFrame + content.length > MAX_FRAME_BYTES) {
-        // Re-queue remaining segments as raw content for next flush
-        const remaining = segments.slice(i).map(s => {
-          if (!s) return '';
-          return s.startsWith(DEC_SYNC_START) ? s.slice(DEC_SYNC_START.length) : s;
-        }).filter(Boolean).join('');
-        if (remaining) {
-          this.pendingWrites.push(remaining);
-          if (!this.writeFrameScheduled) {
-            this.writeFrameScheduled = true;
-            requestAnimationFrame(() => {
-              this.flushPendingWrites();
-              this.writeFrameScheduled = false;
-            });
-          }
-        }
-        deferred = true;
-        break;
+    if (_joinedLen <= MAX_FRAME_BYTES) {
+      this.terminal.write(joined);
+    } else {
+      // Write first chunk now, defer rest to next frame
+      this.terminal.write(joined.slice(0, MAX_FRAME_BYTES));
+      this.pendingWrites.push(joined.slice(MAX_FRAME_BYTES));
+      deferred = true;
+      if (!this.writeFrameScheduled) {
+        this.writeFrameScheduled = true;
+        requestAnimationFrame(() => {
+          this.flushPendingWrites();
+          this.writeFrameScheduled = false;
+        });
       }
-
-      this.terminal.write(content);
-      bytesThisFrame += content.length;
     }
+    const bytesThisFrame = deferred ? MAX_FRAME_BYTES : _joinedLen;
     const _dt = performance.now() - _t0;
     if (_dt > 100 || deferred) console.warn(`[CRASH-DIAG] flushPendingWrites: ${_dt.toFixed(0)}ms, ${(bytesThisFrame/1024).toFixed(0)}KB written${deferred ? ', rest deferred' : ''} (total ${(_joinedLen/1024).toFixed(0)}KB)`);
 

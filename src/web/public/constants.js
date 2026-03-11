@@ -79,11 +79,11 @@ function scheduleBackground(fn) {
   else { requestAnimationFrame(fn); }
 }
 
-// DEC mode 2026 - Synchronized Output
+// DEC mode 2026 - Synchronized Output (xterm.js 6.0+ handles natively)
 // Wrap terminal writes with these markers to prevent partial-frame flicker.
 // Terminal buffers all output between markers and renders atomically.
 // Supported by: WezTerm, Kitty, Ghostty, iTerm2 3.5+, Windows Terminal, VSCode terminal
-// xterm.js doesn't support DEC 2026 natively, so we implement buffering ourselves.
+// xterm.js 6.0+ supports DEC 2026 natively. Constants kept for reference/stripping.
 const DEC_SYNC_START = '\x1b[?2026h';
 const DEC_SYNC_END = '\x1b[?2026l';
 // Pre-compiled regex for stripping DEC 2026 markers (single pass instead of two replaceAll calls)
