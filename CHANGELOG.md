@@ -1,5 +1,11 @@
 # aicodeman
 
+## 0.4.0
+
+### Minor Changes
+
+- Add five features: disable rate limiting via env var, Chinese UI localization, global resource guard (90% CPU/memory threshold), Claude quota recovery auto-restart, project todo list with auto-respawn trigger. Fix mobile typing focus loss and improve tab UX on phones.
+
 ## 0.3.8
 
 ### Patch Changes
