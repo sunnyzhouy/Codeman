@@ -671,6 +671,15 @@ class CodemanApp {
       this.terminal.scrollLines(lines);
     }, { passive: false });
 
+    // Mobile tap-to-focus: explicitly focus xterm.js on tap so the virtual keyboard
+    // stays active for input. Without this, tapping the terminal after a brief
+    // inactivity may not re-activate the keyboard on iOS/Android.
+    if (MobileDetection.isTouchDevice()) {
+      container.addEventListener('touchend', () => {
+        this.terminal.focus();
+      }, { passive: true });
+    }
+
     // Touch scrolling - only use custom JS scrolling on desktop
     // Mobile uses native browser scrolling via CSS touch-action: pan-y
     const isMobileDevice = MobileDetection.isTouchDevice() && window.innerWidth < 1024;
@@ -3196,13 +3205,20 @@ class CodemanApp {
   _updateActiveTabImmediate(sessionId) {
     const container = this.$('sessionTabs');
     if (!container) return;
+    let activeTabEl = null;
     const tabs = container.querySelectorAll('.session-tab[data-id]');
     for (const tab of tabs) {
       if (tab.dataset.id === sessionId) {
         tab.classList.add('active');
+        activeTabEl = tab;
       } else {
         tab.classList.remove('active');
       }
+    }
+    // On mobile, scroll the active tab into the center of the tab bar so the
+    // user can always see which session is active without manual scrolling.
+    if (activeTabEl && MobileDetection.isTouchDevice()) {
+      activeTabEl.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
     }
   }
 
