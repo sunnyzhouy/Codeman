@@ -1078,7 +1078,7 @@ main() {
             fi
         else
             git fetch --quiet origin
-            git reset --hard origin/master --quiet
+            git reset --hard "origin/$BRANCH" --quiet
         fi
     else
         # Create parent directory
