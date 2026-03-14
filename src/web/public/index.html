@@ -14,11 +14,16 @@
   <!-- xterm.css loaded async — terminal won't display until xterm.js runs anyway -->
   <link rel="preload" href="vendor/xterm.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
   <noscript><link rel="stylesheet" href="vendor/xterm.css"></noscript>
+  <!-- Preload critical resources — lets browser discover these during HTML parse
+       instead of waiting until <script> tags at bottom-of-body are reached. -->
+  <link rel="preload" href="vendor/xterm.min.js" as="script">
+  <link rel="preload" href="constants.js" as="script">
+  <link rel="preload" href="app.js" as="script">
   <!-- Self-hosted xterm.js — eliminates CDN DNS/TLS latency (~100ms).
        'defer' preserves execution order (xterm loads before fit addon). -->
   <script defer src="vendor/xterm.min.js"></script>
   <script defer src="vendor/xterm-addon-fit.min.js"></script>
-  <script defer src="vendor/xterm-addon-webgl.min.js"></script>
+  <!-- WebGL addon lazy-loaded by app.js on desktop only (skipped on mobile, saving 244KB) -->
   <script defer src="vendor/xterm-addon-unicode11.min.js"></script>
   <script defer src="vendor/xterm-zerolag-input.js"></script>
   <!-- Synchronous mobile detection — runs before first paint to prevent panel flash -->

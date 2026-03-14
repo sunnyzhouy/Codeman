@@ -571,6 +571,20 @@ class CodemanApp {
     document.body.classList.add('app-loaded');
   }
 
+  _initWebGL() {
+    if (typeof WebglAddon === 'undefined') return;
+    try {
+      this._webglAddon = new WebglAddon.WebglAddon();
+      this._webglAddon.onContextLoss(() => {
+        console.error('[CRASH-DIAG] WebGL context LOST — falling back to canvas renderer');
+        this._webglAddon.dispose();
+        this._webglAddon = null;
+      });
+      this.terminal.loadAddon(this._webglAddon);
+      console.log('[CRASH-DIAG] WebGL renderer enabled');
+    } catch (_e) { /* WebGL2 unavailable — canvas renderer used */ }
+  }
+
   // ═══════════════════════════════════════════════════════════════
   // Terminal Setup — xterm.js config and input handling
   // ═══════════════════════════════════════════════════════════════
@@ -641,19 +655,19 @@ class CodemanApp {
     // but the 48KB/frame flush cap in flushPendingWrites() now prevents
     // oversized terminal.write() calls that triggered the stalls.
     // Disable with ?nowebgl URL param if GPU issues return.
+    // Lazy-loaded: script downloaded only on desktop (saves 244KB on mobile).
     this._webglAddon = null;
     const skipWebGL = MobileDetection.getDeviceType() !== 'desktop';
-    if (!skipWebGL && !new URLSearchParams(location.search).has('nowebgl') && typeof WebglAddon !== 'undefined') {
-      try {
-        this._webglAddon = new WebglAddon.WebglAddon();
-        this._webglAddon.onContextLoss(() => {
-          console.error('[CRASH-DIAG] WebGL context LOST — falling back to canvas renderer');
-          this._webglAddon.dispose();
-          this._webglAddon = null;
-        });
-        this.terminal.loadAddon(this._webglAddon);
-        console.log('[CRASH-DIAG] WebGL renderer enabled via ?webgl param');
-      } catch (_e) { /* WebGL2 unavailable — canvas renderer used */ }
+    if (!skipWebGL && !new URLSearchParams(location.search).has('nowebgl')) {
+      if (typeof WebglAddon !== 'undefined') {
+        this._initWebGL();
+      } else {
+        // Lazy-load WebGL addon — not bundled in <head> to avoid blocking mobile
+        const wglScript = document.createElement('script');
+        wglScript.src = 'vendor/xterm-addon-webgl.min.js';
+        wglScript.onload = () => this._initWebGL();
+        document.head.appendChild(wglScript);
+      }
     }
 
     this._localEchoOverlay = new LocalEchoOverlay(this.terminal);
