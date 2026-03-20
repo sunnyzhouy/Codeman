@@ -70,6 +70,15 @@ Object.assign(CodemanApp.prototype, {
     const container = document.getElementById('terminalContainer');
     this.terminal.open(container);
 
+    const helperTextarea = container.querySelector('.xterm-helper-textarea');
+    if (helperTextarea) {
+      helperTextarea.setAttribute('autocomplete', 'off');
+      helperTextarea.setAttribute('autocorrect', 'off');
+      helperTextarea.setAttribute('autocapitalize', 'off');
+      helperTextarea.setAttribute('spellcheck', 'false');
+      helperTextarea.setAttribute('data-form-type', 'other');
+    }
+
     // Suppress xterm key handling during CJK IME composition.
     // Without this, xterm processes raw keyDown events (e.g., "Process" key)
     // during composition, causing duplicate or garbled input.
