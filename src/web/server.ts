@@ -32,7 +32,7 @@ import fastifyCompress from '@fastify/compress';
 import fastifyCookie from '@fastify/cookie';
 import fastifyStatic from '@fastify/static';
 import fastifyWebsocket from '@fastify/websocket';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readFileSync, chmodSync } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -100,6 +100,7 @@ import {
   registerHookEventRoutes,
   registerSystemRoutes,
   registerCaseRoutes,
+  registerTodosRoutes,
   registerSessionRoutes,
   registerRespawnRoutes,
   registerRalphRoutes,
@@ -589,7 +590,16 @@ export class WebServer extends EventEmitter {
       cacheControl: false,
       preCompressed: true,
       setHeaders: (res, path) => {
-        if (path.endsWith('.html')) {
+        const fileName = basename(path);
+        const shouldRevalidate =
+          path.endsWith('.html') ||
+          path.endsWith('.css') ||
+          path.endsWith('.js') ||
+          path.endsWith('.json') ||
+          path.endsWith('.map') ||
+          fileName === 'manifest.json';
+
+        if (shouldRevalidate) {
           res.setHeader('Cache-Control', 'no-cache');
         } else {
           res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
@@ -701,6 +711,7 @@ export class WebServer extends EventEmitter {
     registerHookEventRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
     registerCaseRoutes(this.app, ctx);
+    registerTodosRoutes(this.app);
     registerSessionRoutes(this.app, ctx);
     registerRespawnRoutes(this.app, ctx);
     registerRalphRoutes(this.app, ctx);

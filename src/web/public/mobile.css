@@ -458,7 +458,26 @@ html.mobile-init .file-browser-panel {
     left: 8px;
     right: 8px;
     width: auto;
-    bottom: calc(40px + var(--safe-area-bottom));
+    max-width: none;
+    max-height: min(42vh, 340px);
+    bottom: calc(var(--toolbar-height) + var(--safe-area-bottom));
+  }
+
+  .todo-panel-add {
+    padding-bottom: calc(0.65rem + var(--safe-area-bottom));
+  }
+
+  .todo-type-select {
+    width: 84px;
+  }
+
+  .todo-item {
+    flex-direction: column;
+  }
+
+  .todo-item-actions {
+    width: 100%;
+    justify-content: flex-end;
   }
 
   /* App container - prevent scrolling, strict layout */
@@ -955,7 +974,16 @@ html.mobile-init .file-browser-panel {
 
   /* When keyboard is visible, also move accessory bar up */
   .keyboard-visible .keyboard-accessory-bar.visible {
-    /* Position is handled by JS transform along with toolbar */
+    bottom: var(--safe-area-bottom);
+  }
+
+  .keyboard-visible .toolbar {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .keyboard-visible .todo-panel {
+    bottom: calc(44px + var(--safe-area-bottom));
   }
 
   /* Paste overlay for iOS clipboard access */

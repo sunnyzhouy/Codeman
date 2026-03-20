@@ -53,7 +53,8 @@ const MobileDetection = {
 
   /** Check if browser is Safari */
   isSafari() {
-    return /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    const ua = navigator.userAgent;
+    return /Safari/i.test(ua) && !/(CriOS|Chrome|Chromium|EdgiOS|FxiOS|OPiOS|DuckDuckGo|YaBrowser)/i.test(ua);
   },
 
   /** Check if screen is small (phone-sized, <430px) */
@@ -280,6 +281,7 @@ const KeyboardHandler = {
 
     const toolbar = document.querySelector('.toolbar');
     const accessoryBar = document.querySelector('.keyboard-accessory-bar');
+    const todoPanel = document.querySelector('.todo-panel');
     const main = document.querySelector('.main');
 
     if (this.keyboardVisible) {
@@ -298,7 +300,12 @@ const KeyboardHandler = {
         return;
       }
 
-      // Move toolbar up above keyboard
+      document.documentElement.style.setProperty('--keyboard-offset', `${keyboardOffset}px`);
+
+      const accessoryVisible = accessoryBar?.classList.contains('visible');
+      const bottomDockHeight = accessoryVisible ? 54 : 0;
+
+      // Keep the toolbar out of the way while the keyboard is open.
       if (toolbar) {
         toolbar.style.transform = `translateY(${-keyboardOffset}px)`;
       }
@@ -308,10 +315,16 @@ const KeyboardHandler = {
         accessoryBar.style.transform = `translateY(${-keyboardOffset}px)`;
       }
 
-      // Shrink main content area so terminal doesn't extend behind keyboard
-      // Account for keyboard height + toolbar height (40px) + accessory bar (44px)
+      // Keep the todo panel aligned with the moved bottom toolbar stack.
+      if (todoPanel) {
+        todoPanel.style.transform = `translateY(${-keyboardOffset}px)`;
+      }
+
+      // Shrink main content area so content doesn't extend behind the keyboard.
+      // Reserve space only for the visible accessory bar; the main toolbar is
+      // visually hidden while typing on mobile.
       if (main) {
-        main.style.paddingBottom = `${keyboardOffset + 94}px`;
+        main.style.paddingBottom = `${keyboardOffset + bottomDockHeight}px`;
       }
     } else {
       this.resetLayout();
@@ -322,13 +335,23 @@ const KeyboardHandler = {
   resetLayout() {
     const toolbar = document.querySelector('.toolbar');
     const accessoryBar = document.querySelector('.keyboard-accessory-bar');
+    const todoPanel = document.querySelector('.todo-panel');
     const main = document.querySelector('.main');
+
+    document.documentElement.style.setProperty('--keyboard-offset', '0px');
 
     if (toolbar) {
       toolbar.style.transform = '';
+      toolbar.style.display = '';
+      toolbar.style.opacity = '';
+      toolbar.style.pointerEvents = '';
     }
     if (accessoryBar) {
       accessoryBar.style.transform = '';
+      accessoryBar.style.bottom = '';
+    }
+    if (todoPanel) {
+      todoPanel.style.transform = '';
     }
     if (main) {
       main.style.paddingBottom = '';
@@ -337,9 +360,26 @@ const KeyboardHandler = {
 
   /** Called when keyboard appears */
   onKeyboardShow() {
-    // Show keyboard accessory bar
-    if (typeof KeyboardAccessoryBar !== 'undefined') {
+    const activeElement = document.activeElement;
+    const shouldShowAccessory = this.isTerminalInputElement(activeElement);
+    const toolbar = document.querySelector('.toolbar');
+    const accessoryBar = document.querySelector('.keyboard-accessory-bar');
+
+    if (toolbar) {
+      toolbar.style.display = 'none';
+      toolbar.style.opacity = '0';
+      toolbar.style.pointerEvents = 'none';
+    }
+
+    // Only show the terminal accessory bar for terminal/CJK input.
+    if (typeof KeyboardAccessoryBar !== 'undefined' && shouldShowAccessory) {
       KeyboardAccessoryBar.show();
+    } else if (typeof KeyboardAccessoryBar !== 'undefined') {
+      KeyboardAccessoryBar.hide();
+    }
+
+    if (accessoryBar && shouldShowAccessory) {
+      accessoryBar.style.bottom = 'var(--safe-area-bottom)';
     }
 
     // Refit terminal locally AND send resize to server so Claude Code (Ink)
@@ -428,6 +468,18 @@ const KeyboardHandler = {
       }
     }
     return tagName === 'input' || tagName === 'textarea' || el.isContentEditable;
+  },
+
+  /** Check if the focused element belongs to the terminal input stack */
+  isTerminalInputElement(el) {
+    if (!el) return false;
+
+    return (
+      el.id === 'cjkInput' ||
+      el.classList?.contains('xterm-helper-textarea') ||
+      Boolean(el.closest('.terminal-container')) ||
+      Boolean(el.closest('.terminal-wrap'))
+    );
   },
 
   /** Scroll input into view above the keyboard */
