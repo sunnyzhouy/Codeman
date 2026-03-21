@@ -356,6 +356,10 @@ class CodemanApp {
     this.syncWaitTimeout = null; // Timeout for incomplete sync blocks
     this._isLoadingBuffer = false; // true during chunkedTerminalWrite — blocks live SSE writes
     this._loadBufferQueue = null;  // queued SSE events during buffer load
+    this._terminalFlushTimer = null;
+    this._scheduledTerminalResize = null;
+    this._terminalResizeSettledUntil = 0;
+    this._terminalResizeRequestInFlight = false;
 
     // Flicker filter state (buffers output after screen clears)
     this.flickerFilterBuffer = '';
@@ -405,6 +409,18 @@ class CodemanApp {
 
     // DOM element cache for performance (avoid repeated getElementById calls)
     this._elemCache = {};
+    this._perfStats = new Map();
+    this._deferredWorkTimers = new Map();
+    this._fileBrowserLoadGeneration = 0;
+    this._fileBrowserDataRevision = 0;
+    this._lastSessionTabsSignature = '';
+    this._lastFileBrowserRenderSignature = '';
+    this._perfTraceEnabled = new URLSearchParams(location.search).has('perftrace');
+    try {
+      if (!this._perfTraceEnabled) {
+        this._perfTraceEnabled = localStorage.getItem(PERF_TRACE_STORAGE_KEY) === '1';
+      }
+    } catch {}
 
     this.init();
   }
@@ -415,6 +431,98 @@ class CodemanApp {
       this._elemCache[id] = document.getElementById(id);
     }
     return this._elemCache[id];
+  }
+
+  _scheduleDeferredWork(key, fn, delay = LOW_PRIORITY_RENDER_DELAY_MS) {
+    this._cancelDeferredWork(key);
+    const timer = setTimeout(() => {
+      if (this._deferredWorkTimers.get(key) !== timer) return;
+      this._deferredWorkTimers.delete(key);
+      scheduleBackground(fn);
+    }, delay);
+    this._deferredWorkTimers.set(key, timer);
+  }
+
+  _cancelDeferredWork(key) {
+    const timer = this._deferredWorkTimers.get(key);
+    if (!timer) return;
+    clearTimeout(timer);
+    this._deferredWorkTimers.delete(key);
+  }
+
+  _recordPerfMetric(name, durationMs, meta = null) {
+    if (!Number.isFinite(durationMs)) return;
+
+    const existing = this._perfStats.get(name) || { count: 0, totalMs: 0, maxMs: 0 };
+    existing.count += 1;
+    existing.totalMs += durationMs;
+    existing.maxMs = Math.max(existing.maxMs, durationMs);
+    this._perfStats.set(name, existing);
+
+    if (!this._perfTraceEnabled && durationMs < PERF_TRACE_LOG_THRESHOLD_MS) {
+      return;
+    }
+
+    const avgMs = existing.totalMs / existing.count;
+    const parts = [
+      `[PERF] ${name}`,
+      `${durationMs.toFixed(1)}ms`,
+      `count=${existing.count}`,
+      `avg=${avgMs.toFixed(1)}ms`,
+      `max=${existing.maxMs.toFixed(1)}ms`,
+    ];
+    if (meta && typeof meta === 'object') {
+      for (const [key, value] of Object.entries(meta)) {
+        if (value !== undefined && value !== null && value !== '') {
+          parts.push(`${key}=${value}`);
+        }
+      }
+    }
+    console.debug(parts.join(' '));
+  }
+
+  _ensureFileBrowserDragListeners(fileBrowserPanel) {
+    if (!fileBrowserPanel || this.fileBrowserDragListeners) return;
+    const header = fileBrowserPanel.querySelector('.file-browser-header');
+    if (!header) return;
+
+    const onFirstDrag = () => {
+      if (!fileBrowserPanel.style.left) {
+        const rect = fileBrowserPanel.getBoundingClientRect();
+        fileBrowserPanel.style.left = `${rect.left}px`;
+        fileBrowserPanel.style.top = `${rect.top}px`;
+        fileBrowserPanel.style.right = 'auto';
+      }
+    };
+    header.addEventListener('mousedown', onFirstDrag);
+    header.addEventListener('touchstart', onFirstDrag, { passive: true });
+    this.fileBrowserDragListeners = this.makeWindowDraggable(fileBrowserPanel, header);
+    this.fileBrowserDragListeners._onFirstDrag = onFirstDrag;
+  }
+
+  _getSessionTabsRenderSignature() {
+    const parts = [this.activeSessionId || '', String(this.sessionOrder.length)];
+    for (const id of this.sessionOrder) {
+      const session = this.sessions.get(id);
+      if (!session) {
+        parts.push(`${id}:missing`);
+        continue;
+      }
+      const taskStats = session.taskStats || { running: 0 };
+      const minimizedCount = this.minimizedSubagents.get(id)?.size || 0;
+      parts.push([
+        id,
+        session.status || 'idle',
+        this.getSessionName(session),
+        session.color || 'default',
+        session.mode || 'claude',
+        taskStats.running || 0,
+        this.tabAlerts.get(id) || '',
+        minimizedCount,
+        session._ended ? 1 : 0,
+      ].join('|'));
+    }
+    return parts.join('||');
   }
 
   // Format token count: 1000k -> 1m, 1450k -> 1.45m, 500 -> 500
@@ -653,6 +761,11 @@ class CodemanApp {
 
     // Color picker for session customization
     this.setupColorPicker();
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
+      this.updateConnectionLines();
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -884,7 +997,7 @@ class CodemanApp {
         // Resize PTY to match actual browser dimensions (critical for OpenCode
         // TUI sessions that render at fixed 120x40 until told the real size)
         if (this.activeSessionId) {
-          this.sendResize(this.activeSessionId);
+          this.scheduleTerminalResize(this.activeSessionId);
         }
       }
     } catch (err) {
@@ -910,7 +1023,7 @@ class CodemanApp {
         }
 
         // Fire-and-forget resize — don't block on it
-        this.sendResize(data.id);
+        this.scheduleTerminalResize(data.id);
         // Re-position local echo overlay at new prompt location
         this._localEchoOverlay?.rerender();
       } catch (err) {
@@ -1285,6 +1398,7 @@ class CodemanApp {
   }
 
   handleInit(data) {
+    const perfStart = performance.now();
     // Clear the init fallback timer since we got data
     if (this._initFallbackTimer) {
       clearTimeout(this._initFallbackTimer);
@@ -1340,6 +1454,8 @@ class CodemanApp {
       clearTimeout(this.syncWaitTimeout);
       this.syncWaitTimeout = null;
     }
+    this._cancelScheduledTerminalFlush?.();
+    this._cancelScheduledTerminalResize?.();
     this.pendingWrites = [];
     this.writeFrameScheduled = false;
     this._isLoadingBuffer = false;
@@ -1511,6 +1627,10 @@ class CodemanApp {
         this.selectSession(this.sessionOrder[0]);
       }
     }
+    this._recordPerfMetric('handleInit', performance.now() - perfStart, {
+      sessions: data.sessions?.length || 0,
+      subagents: data.subagents?.length || 0,
+    });
   }
 
   async loadState() {
@@ -1552,10 +1672,21 @@ class CodemanApp {
   }
 
   _renderSessionTabsImmediate() {
+    const perfStart = performance.now();
     const container = this.$('sessionTabs');
+    if (!container) return;
     const existingTabs = container.querySelectorAll('.session-tab[data-id]');
     const existingIds = new Set([...existingTabs].map(t => t.dataset.id));
     const currentIds = new Set(this.sessions.keys());
+    const signature = this._getSessionTabsRenderSignature();
+    if (existingTabs.length === currentIds.size && signature === this._lastSessionTabsSignature) {
+      this._recordPerfMetric('renderSessionTabs', performance.now() - perfStart, {
+        sessions: this.sessions.size,
+        mode: 'skip',
+      });
+      return;
+    }
+    let mode = 'incremental';
 
     // Check if we can do incremental update (same session IDs)
     const canIncremental = existingIds.size === currentIds.size &&
@@ -1611,12 +1742,24 @@ class CodemanApp {
             }
           } else {
             // Need to add badge - do full rebuild
+            mode = 'full';
             this._fullRenderSessionTabs();
+            this._lastSessionTabsSignature = signature;
+            this._recordPerfMetric('renderSessionTabs', performance.now() - perfStart, {
+              sessions: this.sessions.size,
+              mode,
+            });
             return;
           }
         } else if (badgeEl) {
           // Need to remove badge - do full rebuild
+          mode = 'full';
           this._fullRenderSessionTabs();
+          this._lastSessionTabsSignature = signature;
+          this._recordPerfMetric('renderSessionTabs', performance.now() - perfStart, {
+            sessions: this.sessions.size,
+            mode,
+          });
           return;
         }
 
@@ -1656,9 +1799,14 @@ class CodemanApp {
       }
     } else {
       // Full rebuild needed (sessions added/removed)
+      mode = 'full';
       this._fullRenderSessionTabs();
     }
-
+    this._lastSessionTabsSignature = signature;
+    this._recordPerfMetric('renderSessionTabs', performance.now() - perfStart, {
+      sessions: this.sessions.size,
+      mode,
+    });
   }
 
   _fullRenderSessionTabs() {
@@ -1966,10 +2114,15 @@ class CodemanApp {
     const _selName = this.sessions.get(sessionId)?.name || sessionId.slice(0,8);
     _crashDiag.log(`SELECT: ${_selName}`);
     console.log(`[CRASH-DIAG] selectSession START: ${sessionId.slice(0,8)}`);
+    let hadCachedBuffer = false;
+    let selectOutcome = 'success';
 
     const selectGen = ++this._selectGeneration;
 
     if (selectGen !== this._selectGeneration) return; // newer tab switch won
+
+    this._cancelDeferredWork('select-session-secondary');
+    this._cancelDeferredWork('select-session-file-browser');
 
     // Close WebSocket for previous session (new one opens after buffer load)
     this._disconnectWs();
@@ -1998,6 +2151,8 @@ class CodemanApp {
       clearTimeout(this.syncWaitTimeout);
       this.syncWaitTimeout = null;
     }
+    this._cancelScheduledTerminalFlush?.();
+    this._cancelScheduledTerminalResize?.();
     this.pendingWrites = [];
     this.writeFrameScheduled = false;
     this._isLoadingBuffer = false;
@@ -2122,6 +2277,7 @@ class CodemanApp {
       // Direct terminal.write() of large cached buffers (256KB+) can block the main thread
       // for 5+ seconds while the WebGL renderer processes ReadPixels synchronously.
       const cachedBuffer = this.terminalBufferCache.get(sessionId);
+      hadCachedBuffer = !!cachedBuffer;
       if (cachedBuffer) {
         _crashDiag.log(`CACHE_WRITE: ${(cachedBuffer.length/1024).toFixed(0)}KB`);
         this.terminal.clear();
@@ -2199,83 +2355,9 @@ class CodemanApp {
 
       // Fire-and-forget resize — don't await to avoid blocking UI.
       // The resize triggers an Ink redraw in Claude which streams back via SSE.
-      this.sendResize(sessionId);
+      this.scheduleTerminalResize(sessionId);
 
-      // Defer secondary panel updates so they don't block the main thread
-      // after terminal content is already visible.
-      const idleCb = typeof requestIdleCallback === 'function' ? requestIdleCallback : (cb) => setTimeout(cb, 16);
-      idleCb(() => {
-        // Guard against stale generation — user may have switched tabs again
-        if (selectGen !== this._selectGeneration) return;
-
-        // Update respawn banner
-        if (this.respawnStatus[sessionId]) {
-          this.showRespawnBanner();
-          this.updateRespawnBanner(this.respawnStatus[sessionId].state);
-          document.getElementById('respawnCycleCount').textContent = this.respawnStatus[sessionId].cycleCount || 0;
-          this.updateCountdownTimerDisplay();
-          this.updateActionLogDisplay();
-          if (Object.keys(this.respawnCountdownTimers[sessionId] || {}).length > 0) {
-            this.startCountdownInterval();
-          }
-        } else {
-          this.hideRespawnBanner();
-          this.stopCountdownInterval();
-        }
-
-        // Update task panel if open
-        const taskPanel = document.getElementById('taskPanel');
-        if (taskPanel && taskPanel.classList.contains('open')) {
-          this.renderTaskPanel();
-        }
-
-        // Update ralph state panel for this session
-        const curSession = this.sessions.get(sessionId);
-        if (curSession && (curSession.ralphLoop || curSession.ralphTodos)) {
-          this.updateRalphState(sessionId, {
-            loop: curSession.ralphLoop,
-            todos: curSession.ralphTodos
-          });
-        }
-        this.renderRalphStatePanel();
-
-        // Update CLI info bar (mobile - shows Claude version/model)
-        this.updateCliInfoDisplay();
-
-        // Update project insights panel for this session
-        this.renderProjectInsightsPanel();
-
-        // Update subagent window visibility for active session
-        this.updateSubagentWindowVisibility();
-
-        // Load file browser if enabled
-        const settings = this.loadAppSettingsFromStorage();
-        if (settings.showFileBrowser) {
-          const fileBrowserPanel = this.$('fileBrowserPanel');
-          if (fileBrowserPanel) {
-            fileBrowserPanel.classList.add('visible');
-            this.loadFileBrowser(sessionId);
-            // Attach drag listeners if not already attached
-            if (!this.fileBrowserDragListeners) {
-              const header = fileBrowserPanel.querySelector('.file-browser-header');
-              if (header) {
-                const onFirstDrag = () => {
-                  if (!fileBrowserPanel.style.left) {
-                    const rect = fileBrowserPanel.getBoundingClientRect();
-                    fileBrowserPanel.style.left = `${rect.left}px`;
-                    fileBrowserPanel.style.top = `${rect.top}px`;
-                    fileBrowserPanel.style.right = 'auto';
-                  }
-                };
-                header.addEventListener('mousedown', onFirstDrag);
-                header.addEventListener('touchstart', onFirstDrag, { passive: true });
-                this.fileBrowserDragListeners = this.makeWindowDraggable(fileBrowserPanel, header);
-                this.fileBrowserDragListeners._onFirstDrag = onFirstDrag;
-              }
-            }
-          }
-        }
-      });
+      this._scheduleSelectSessionDeferredWork(sessionId, selectGen);
 
       // Open WebSocket for low-latency terminal I/O (after buffer load completes)
       this._connectWs(sessionId);
@@ -2286,10 +2368,74 @@ class CodemanApp {
       _crashDiag.log(`SELECT_DONE: ${(performance.now() - _selStart).toFixed(0)}ms`);
       console.log(`[CRASH-DIAG] selectSession DONE: ${sessionId.slice(0,8)} in ${(performance.now() - _selStart).toFixed(0)}ms`);
     } catch (err) {
+      selectOutcome = 'error';
       if (this._isLoadingBuffer) this._finishBufferLoad();
       this._restoringFlushedState = false;
       console.error('Failed to load session terminal:', err);
+    } finally {
+      this._recordPerfMetric('selectSession', performance.now() - _selStart, {
+        session: sessionId.slice(0, 8),
+        cached: hadCachedBuffer ? 'yes' : 'no',
+        outcome: selectOutcome,
+      });
     }
+  }
+
+  _scheduleSelectSessionDeferredWork(sessionId, selectGen) {
+    this._scheduleDeferredWork('select-session-secondary', () => {
+      const perfStart = performance.now();
+      if (selectGen !== this._selectGeneration || sessionId !== this.activeSessionId) return;
+
+      if (this.respawnStatus[sessionId]) {
+        this.showRespawnBanner();
+        this.updateRespawnBanner(this.respawnStatus[sessionId].state);
+        document.getElementById('respawnCycleCount').textContent = this.respawnStatus[sessionId].cycleCount || 0;
+        this.updateCountdownTimerDisplay();
+        this.updateActionLogDisplay();
+        if (Object.keys(this.respawnCountdownTimers[sessionId] || {}).length > 0) {
+          this.startCountdownInterval();
+        }
+      } else {
+        this.hideRespawnBanner();
+        this.stopCountdownInterval();
+      }
+
+      this.renderTaskPanel();
+
+      const curSession = this.sessions.get(sessionId);
+      if (curSession && (curSession.ralphLoop || curSession.ralphTodos)) {
+        this.updateRalphState(sessionId, {
+          loop: curSession.ralphLoop,
+          todos: curSession.ralphTodos
+        });
+      }
+      this.renderRalphStatePanel();
+      this.updateCliInfoDisplay();
+      this.renderProjectInsightsPanel();
+      this.updateSubagentWindowVisibility();
+
+      this._recordPerfMetric('selectSession:secondary', performance.now() - perfStart, {
+        session: sessionId.slice(0, 8),
+      });
+    });
+
+    this._scheduleDeferredWork('select-session-file-browser', () => {
+      const perfStart = performance.now();
+      if (selectGen !== this._selectGeneration || sessionId !== this.activeSessionId) return;
+
+      const settings = this.loadAppSettingsFromStorage();
+      if (!settings.showFileBrowser) return;
+
+      const fileBrowserPanel = this.$('fileBrowserPanel');
+      if (!fileBrowserPanel) return;
+      fileBrowserPanel.classList.add('visible');
+      this._ensureFileBrowserDragListeners(fileBrowserPanel);
+      this.loadFileBrowser(sessionId);
+
+      this._recordPerfMetric('selectSession:fileBrowser', performance.now() - perfStart, {
+        session: sessionId.slice(0, 8),
+      });
+    }, FILE_BROWSER_DEFER_DELAY_MS);
   }
 
   // Shared cleanup for all session data — called from both closeSession() and session:deleted handler

@@ -55,8 +55,17 @@ const AUTO_CLOSE_NOTIFICATION_MS = 8000;    // Auto-close browser notifications
 const THROTTLE_DELAY_MS = 100;              // General UI throttle delay
 const TERMINAL_CHUNK_SIZE = 32 * 1024;      // 32KB chunks for terminal buffer loading
 const TERMINAL_TAIL_SIZE = 128 * 1024;      // 128KB tail for initial load
+const TERMINAL_WRITE_FRAME_BUDGET_BYTES = 64 * 1024; // Max bytes flushed to xterm in one frame
+const TERMINAL_RESIZE_DEBOUNCE_MS = 300;    // Trailing-edge resize debounce for fit + SIGWINCH
+const TERMINAL_RESIZE_SETTLE_MS = 120;      // Brief cooldown after resize/reflow work
+const TERMINAL_RESIZE_RETRY_DELAY_MS = 96;  // Retry delay while terminal is still busy
 const SYNC_WAIT_TIMEOUT_MS = 50;            // Wait timeout for terminal sync
 const STATS_POLLING_INTERVAL_MS = 2000;     // System stats polling
+const LOW_PRIORITY_RENDER_DELAY_MS = 120;   // Delay for secondary UI work
+const CONNECTION_LINES_DEBOUNCE_MS = 80;    // Coalesce SVG line redraws
+const FILE_BROWSER_DEFER_DELAY_MS = 220;    // Delay heavy file browser fetches on tab switch
+const PERF_TRACE_LOG_THRESHOLD_MS = 16;     // Log frames slower than one 60fps budget
+const PERF_TRACE_STORAGE_KEY = 'codeman-perf-trace';
 
 // Z-index base values for layered floating windows
 const ZINDEX_SUBAGENT_BASE = 1000;

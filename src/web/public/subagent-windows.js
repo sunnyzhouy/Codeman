@@ -228,18 +228,12 @@ Object.assign(CodemanApp.prototype, {
   // This map stores agentId -> sessionId, where sessionId is the tab's data-id.
 
   updateConnectionLines() {
-    // Coalesce multiple calls — uses background scheduler priority to avoid
-    // competing with terminal writes for main thread time
-    if (!this._connectionLinesScheduled) {
-      this._connectionLinesScheduled = true;
-      scheduleBackground(() => {
-        this._connectionLinesScheduled = false;
-        this._updateConnectionLinesImmediate();
-      });
-    }
+    if (document.visibilityState === 'hidden') return;
+    this._scheduleDeferredWork('connection-lines', () => this._updateConnectionLinesImmediate(), CONNECTION_LINES_DEBOUNCE_MS);
   },
 
   _updateConnectionLinesImmediate() {
+    const perfStart = performance.now();
     const svg = document.getElementById('connectionLines');
     if (!svg) return;
 
@@ -261,6 +255,15 @@ Object.assign(CodemanApp.prototype, {
     const planSubagentArray = Array.from(this.planSubagents.entries())
       .filter(([, data]) => data.element)
       .map(([id, data]) => ({ id, ...data }));
+
+    if (!wizardOpen && visibleSubagentWindows.length === 0 && planSubagentArray.length === 0) {
+      if (svg.childElementCount > 0) svg.innerHTML = '';
+      this._recordPerfMetric('updateConnectionLines', performance.now() - perfStart, {
+        lines: 0,
+        windows: 0,
+      });
+      return;
+    }
 
     // === PHASE 1: Batch all layout reads (getBoundingClientRect) ===
     // Reading layout properties forces the browser to calculate layout.
@@ -304,6 +307,7 @@ Object.assign(CodemanApp.prototype, {
 
     // === PHASE 2: DOM writes using cached rects (no more layout reads) ===
     svg.innerHTML = '';
+    let lineCount = 0;
 
     for (const { agentId } of visibleSubagentWindows) {
       const winRect = rects.get('sub:' + agentId);
@@ -357,6 +361,7 @@ Object.assign(CodemanApp.prototype, {
           line.setAttribute('data-agent-id', agentId);
           line.setAttribute('data-plan-agent-id', nearestPlanAgent.id);
           svg.appendChild(line);
+          lineCount++;
         }
       } else if (wizardOpen && wizardContent) {
         // Wizard open but no plan subagents - connect directly to wizard
@@ -385,6 +390,7 @@ Object.assign(CodemanApp.prototype, {
         line.setAttribute('class', 'connection-line wizard-connection');
         line.setAttribute('data-agent-id', agentId);
         svg.appendChild(line);
+        lineCount++;
       } else {
         // NORMAL MODE: Connect agent window to its parent TAB
         // Use the PERSISTENT subagentParentMap as the ONLY source of truth
@@ -417,6 +423,7 @@ Object.assign(CodemanApp.prototype, {
         line.setAttribute('data-agent-id', agentId);
         line.setAttribute('data-parent-tab', parentSessionId);
         svg.appendChild(line);
+        lineCount++;
       }
     }
 
@@ -453,8 +460,13 @@ Object.assign(CodemanApp.prototype, {
         line.setAttribute('class', 'connection-line wizard-connection plan-subagent-line');
         line.setAttribute('data-plan-agent-id', agentId);
         svg.appendChild(line);
+        lineCount++;
       }
     }
+    this._recordPerfMetric('updateConnectionLines', performance.now() - perfStart, {
+      lines: lineCount,
+      windows: visibleSubagentWindows.length,
+    });
   },
 
   // ═══════════════════════════════════════════════════════════════
