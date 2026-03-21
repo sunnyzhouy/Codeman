@@ -247,6 +247,7 @@ Object.assign(CodemanApp.prototype, {
         if (this.fitAddon) {
           this.fitAddon.fit();
         }
+        this._markTerminalResizeSettling();
         // Flush any stale flicker buffer before clearing viewport
         if (this.flickerFilterBuffer) {
           if (this.flickerFilterTimeout) {
@@ -280,11 +281,7 @@ Object.assign(CodemanApp.prototype, {
               cols !== this._lastResizeDims.cols ||
               rows !== this._lastResizeDims.rows) {
             this._lastResizeDims = { cols, rows };
-            fetch(`/api/sessions/${this.activeSessionId}/resize`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ cols, rows })
-            }).catch(() => {});
+            this.scheduleTerminalResize(this.activeSessionId).catch(() => {});
           }
         }
         // Update subagent connection lines and local echo at new dimensions
@@ -292,7 +289,7 @@ Object.assign(CodemanApp.prototype, {
         if (this._localEchoOverlay?.hasPending) {
           this._localEchoOverlay.rerender();
         }
-      }, 300); // Trailing-edge: only fire after 300ms of no resize events
+      }, TERMINAL_RESIZE_DEBOUNCE_MS); // Trailing-edge: only fire after resize settles
     };
 
     window.addEventListener('resize', throttledResize);
@@ -784,6 +781,65 @@ Object.assign(CodemanApp.prototype, {
     return buffer.viewportY >= buffer.baseY - 2;
   },
 
+  _markTerminalResizeSettling(durationMs = TERMINAL_RESIZE_SETTLE_MS) {
+    this._terminalResizeSettledUntil = performance.now() + durationMs;
+  },
+
+  _getTerminalBusyDelay({ includeInFlightResize = true } = {}) {
+    const now = performance.now();
+    let delay = 0;
+
+    if (this._resizeTimeout) {
+      delay = Math.max(delay, TERMINAL_RESIZE_DEBOUNCE_MS);
+    }
+    if (includeInFlightResize && this._terminalResizeRequestInFlight) {
+      delay = Math.max(delay, TERMINAL_RESIZE_RETRY_DELAY_MS);
+    }
+    if (this._terminalResizeSettledUntil > now) {
+      delay = Math.max(delay, Math.ceil(this._terminalResizeSettledUntil - now));
+    }
+
+    return delay;
+  },
+
+  _cancelScheduledTerminalFlush() {
+    if (!this._terminalFlushTimer) return;
+    clearTimeout(this._terminalFlushTimer);
+    this._terminalFlushTimer = null;
+    this.writeFrameScheduled = false;
+  },
+
+  _scheduleTerminalFlush(delay = 0) {
+    if (this.writeFrameScheduled) return;
+
+    const totalDelay = Math.max(delay, this._getTerminalBusyDelay());
+    const runFlush = () => {
+      requestAnimationFrame(() => {
+        this.writeFrameScheduled = false;
+        this.flushPendingWrites();
+      });
+    };
+
+    this.writeFrameScheduled = true;
+    if (totalDelay > 0) {
+      this._terminalFlushTimer = setTimeout(() => {
+        this._terminalFlushTimer = null;
+        runFlush();
+      }, totalDelay);
+      return;
+    }
+
+    runFlush();
+  },
+
+  _cancelScheduledTerminalResize() {
+    if (!this._scheduledTerminalResize) return;
+    const scheduled = this._scheduledTerminalResize;
+    if (scheduled.timer) clearTimeout(scheduled.timer);
+    this._scheduledTerminalResize = null;
+    scheduled.resolve(false);
+  },
+
   batchTerminalWrite(data) {
     // If a buffer load (chunkedTerminalWrite) is in progress, queue live events
     // to prevent interleaving historical buffer data with live SSE data.
@@ -839,16 +895,9 @@ Object.assign(CodemanApp.prototype, {
     // Accumulate raw data (may contain DEC 2026 markers)
     this.pendingWrites.push(data);
 
-    if (!this.writeFrameScheduled) {
-      this.writeFrameScheduled = true;
-      requestAnimationFrame(() => {
-        // xterm.js 6.0 handles DEC 2026 sync markers natively — it buffers
-        // content between 2026h/2026l and renders atomically. No need for
-        // client-side incomplete-block detection; just flush every frame.
-        this.flushPendingWrites();
-        this.writeFrameScheduled = false;
-      });
-    }
+    // Delay live flushes while resize/buffer restore settles so xterm isn't
+    // doing write + reflow + SIGWINCH work on the same frame.
+    this._scheduleTerminalFlush();
   },
 
   /**
@@ -864,13 +913,7 @@ Object.assign(CodemanApp.prototype, {
     this.flickerFilterActive = false;
 
     // Trigger a normal flush
-    if (!this.writeFrameScheduled) {
-      this.writeFrameScheduled = true;
-      requestAnimationFrame(() => {
-        this.flushPendingWrites();
-        this.writeFrameScheduled = false;
-      });
-    }
+    this._scheduleTerminalFlush();
   },
 
   /**
@@ -928,6 +971,11 @@ Object.assign(CodemanApp.prototype, {
    */
   flushPendingWrites() {
     if (this.pendingWrites.length === 0 || !this.terminal) return;
+    const busyDelay = this._getTerminalBusyDelay();
+    if (busyDelay > 0) {
+      this._scheduleTerminalFlush(busyDelay);
+      return;
+    }
 
     const _t0 = performance.now();
     // xterm.js 6.0+ natively handles DEC 2026 synchronized output markers.
@@ -940,7 +988,7 @@ Object.assign(CodemanApp.prototype, {
 
     // Per-frame byte budget to prevent main thread blocking.
     // Large writes (141KB+) can freeze Chrome for 2+ minutes.
-    const MAX_FRAME_BYTES = 65536; // 64KB budget per frame
+    const MAX_FRAME_BYTES = TERMINAL_WRITE_FRAME_BUDGET_BYTES;
     let deferred = false;
 
     if (_joinedLen <= MAX_FRAME_BYTES) {
@@ -950,16 +998,14 @@ Object.assign(CodemanApp.prototype, {
       this.terminal.write(joined.slice(0, MAX_FRAME_BYTES));
       this.pendingWrites.push(joined.slice(MAX_FRAME_BYTES));
       deferred = true;
-      if (!this.writeFrameScheduled) {
-        this.writeFrameScheduled = true;
-        requestAnimationFrame(() => {
-          this.flushPendingWrites();
-          this.writeFrameScheduled = false;
-        });
-      }
+      this._scheduleTerminalFlush();
     }
     const bytesThisFrame = deferred ? MAX_FRAME_BYTES : _joinedLen;
     const _dt = performance.now() - _t0;
+    this._recordPerfMetric('flushPendingWrites', _dt, {
+      kb: Math.round(_joinedLen / 1024),
+      deferred: deferred ? 'yes' : 'no',
+    });
     if (_dt > 100 || deferred) console.warn(`[CRASH-DIAG] flushPendingWrites: ${_dt.toFixed(0)}ms, ${(bytesThisFrame/1024).toFixed(0)}KB written${deferred ? ', rest deferred' : ''} (total ${(_joinedLen/1024).toFixed(0)}KB)`);
 
     // Sticky scroll: if user was at bottom, keep them there after new output
@@ -1056,8 +1102,17 @@ Object.assign(CodemanApp.prototype, {
       const _chunkStart = performance.now();
       let _chunkCount = 0;
       const writeChunk = () => {
+        const busyDelay = this._getTerminalBusyDelay({ includeInFlightResize: false });
+        if (busyDelay > 0) {
+          setTimeout(() => requestAnimationFrame(writeChunk), busyDelay);
+          return;
+        }
         if (offset >= cleanBuffer.length) {
           const _totalMs = performance.now() - _chunkStart;
+          this._recordPerfMetric('chunkedTerminalWrite', _totalMs, {
+            kb: Math.round(cleanBuffer.length / 1024),
+            chunks: _chunkCount,
+          });
           console.log(`[CRASH-DIAG] chunkedTerminalWrite complete: ${cleanBuffer.length} bytes in ${_chunkCount} chunks, ${_totalMs.toFixed(0)}ms total`);
           // Wait one more frame for xterm to finish rendering before resolving
           requestAnimationFrame(finish);
@@ -1089,6 +1144,7 @@ Object.assign(CodemanApp.prototype, {
     const queue = this._loadBufferQueue;
     this._isLoadingBuffer = false;
     this._loadBufferQueue = null;
+    this._markTerminalResizeSettling();
     if (queue && queue.length > 0) {
       for (const data of queue) {
         this.batchTerminalWrite(data);
@@ -1111,7 +1167,8 @@ Object.assign(CodemanApp.prototype, {
    * Sends resize to PTY and Ctrl+L to trigger Claude to redraw.
    */
   async restoreTerminalSize() {
-    if (!this.activeSessionId) {
+    const sessionId = this.activeSessionId;
+    if (!sessionId) {
       this.showToast('No active session', 'warning');
       return;
     }
@@ -1124,10 +1181,13 @@ Object.assign(CodemanApp.prototype, {
 
     try {
       // Send resize to restore proper dimensions (with minimum enforcement)
-      await this.sendResize(this.activeSessionId);
+      const didResize = await this.scheduleTerminalResize(sessionId);
+      if (didResize === false || this.activeSessionId !== sessionId) {
+        return;
+      }
 
       // Send Ctrl+L to trigger Claude to redraw at new size
-      await fetch(`/api/sessions/${this.activeSessionId}/input`, {
+      await fetch(`/api/sessions/${sessionId}/input`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ input: '\x0c' })
@@ -1153,7 +1213,8 @@ Object.assign(CodemanApp.prototype, {
     }
 
     // Send resize + Ctrl+L to fix the display (with minimum dimension enforcement)
-    this.sendResize(sessionId).then(() => {
+    this.scheduleTerminalResize(sessionId).then((didResize) => {
+      if (didResize === false || sessionId !== this.activeSessionId) return;
       fetch(`/api/sessions/${sessionId}/input`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1231,6 +1292,9 @@ Object.assign(CodemanApp.prototype, {
   async sendResize(sessionId) {
     const dims = this.getTerminalDimensions();
     if (!dims) return;
+    if (sessionId === this.activeSessionId) {
+      this._lastResizeDims = dims;
+    }
     // Fast path: WebSocket resize
     if (this._wsReady && this._wsSessionId === sessionId) {
       try {
@@ -1245,6 +1309,76 @@ Object.assign(CodemanApp.prototype, {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(dims)
     });
+  },
+
+  scheduleTerminalResize(sessionId, { delay = 0 } = {}) {
+    if (!sessionId) return Promise.resolve(false);
+
+    const activeAndBusy = sessionId === this.activeSessionId && this._isLoadingBuffer;
+    const busyDelay = Math.max(
+      delay,
+      this._getTerminalBusyDelay({ includeInFlightResize: false }),
+      activeAndBusy ? TERMINAL_RESIZE_RETRY_DELAY_MS : 0
+    );
+
+    const existing = this._scheduledTerminalResize;
+    if (existing?.sessionId === sessionId) {
+      if (existing.timer) clearTimeout(existing.timer);
+      existing.timer = setTimeout(existing.run, busyDelay);
+      return existing.promise;
+    }
+    if (existing) {
+      this._cancelScheduledTerminalResize();
+    }
+
+    let resolvePromise;
+    let rejectPromise;
+    const promise = new Promise((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+
+    const scheduled = {
+      sessionId,
+      timer: null,
+      promise,
+      resolve: resolvePromise,
+      reject: rejectPromise,
+      run: async () => {
+        if (this._scheduledTerminalResize !== scheduled) return;
+        scheduled.timer = null;
+
+        const stillBusy = sessionId === this.activeSessionId && this._isLoadingBuffer;
+        const retryDelay = Math.max(
+          this._getTerminalBusyDelay({ includeInFlightResize: false }),
+          stillBusy ? TERMINAL_RESIZE_RETRY_DELAY_MS : 0
+        );
+        if (retryDelay > 0) {
+          scheduled.timer = setTimeout(scheduled.run, retryDelay);
+          return;
+        }
+
+        this._scheduledTerminalResize = null;
+        this._terminalResizeRequestInFlight = true;
+        try {
+          await this.sendResize(sessionId);
+          this._markTerminalResizeSettling();
+          scheduled.resolve(true);
+        } catch (err) {
+          scheduled.reject(err);
+        } finally {
+          this._terminalResizeRequestInFlight = false;
+        }
+      },
+    };
+
+    this._scheduledTerminalResize = scheduled;
+    if (busyDelay > 0) {
+      scheduled.timer = setTimeout(scheduled.run, busyDelay);
+    } else {
+      scheduled.run();
+    }
+    return promise;
   },
 
   /**

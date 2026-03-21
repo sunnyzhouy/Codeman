@@ -621,6 +621,9 @@ Object.assign(CodemanApp.prototype, {
   },
 
   renderTaskPanel() {
+    const taskPanel = document.getElementById('taskPanel');
+    if (!taskPanel || !taskPanel.classList.contains('open')) return;
+
     // Debounce renders at 100ms to prevent excessive DOM updates
     if (this.renderTaskPanelTimeout) {
       clearTimeout(this.renderTaskPanelTimeout);
@@ -631,16 +634,19 @@ Object.assign(CodemanApp.prototype, {
   },
 
   _renderTaskPanelImmediate() {
+    const perfStart = performance.now();
     const session = this.sessions.get(this.activeSessionId);
     const body = document.getElementById('backgroundTasksBody');
     const stats = document.getElementById('taskPanelStats');
     const section = document.getElementById('backgroundTasksSection');
+    if (!body || !stats) return;
 
     if (!session || !session.taskTree || session.taskTree.length === 0) {
       // Hide the entire section when there are no background tasks
       if (section) section.style.display = 'none';
       body.innerHTML = '';
       stats.textContent = '0 tasks';
+      this._recordPerfMetric('renderTaskPanel', performance.now() - perfStart, { tasks: 0 });
       return;
     }
 
@@ -697,6 +703,9 @@ Object.assign(CodemanApp.prototype, {
     html += '</div>';
 
     body.innerHTML = html;
+    this._recordPerfMetric('renderTaskPanel', performance.now() - perfStart, {
+      tasks: session.taskTree.length,
+    });
   },
 
   flattenTaskTree(tasks, result = []) {
@@ -729,16 +738,16 @@ Object.assign(CodemanApp.prototype, {
   },
 
   renderSubagentPanel() {
-    // Debounce renders at 150ms to prevent excessive DOM updates from rapid subagent events
-    if (this._subagentPanelRenderTimeout) {
-      clearTimeout(this._subagentPanelRenderTimeout);
+    const monitorPanel = document.getElementById('monitorPanel');
+    if (!this.subagentPanelVisible && !monitorPanel?.classList.contains('open')) {
+      this.updateSubagentBadge();
+      return;
     }
-    this._subagentPanelRenderTimeout = setTimeout(() => {
-      scheduleBackground(() => this._renderSubagentPanelImmediate());
-    }, 150);
+    this._scheduleDeferredWork('render-subagent-panel', () => this._renderSubagentPanelImmediate(), LOW_PRIORITY_RENDER_DELAY_MS);
   },
 
   _renderSubagentPanelImmediate() {
+    const perfStart = performance.now();
     const list = this.$('subagentList');
     if (!list) return;
 
@@ -750,12 +759,20 @@ Object.assign(CodemanApp.prototype, {
 
     // If panel is not visible, don't render content
     if (!this.subagentPanelVisible) {
+      this._recordPerfMetric('renderSubagentPanel', performance.now() - perfStart, {
+        agents: this.subagents.size,
+        mode: 'badge-only',
+      });
       return;
     }
 
     // Render subagent list
     if (this.subagents.size === 0) {
       list.innerHTML = '<div class="subagent-empty">No background agents detected</div>';
+      this._recordPerfMetric('renderSubagentPanel', performance.now() - perfStart, {
+        agents: 0,
+        mode: 'empty',
+      });
       return;
     }
 
@@ -808,6 +825,10 @@ Object.assign(CodemanApp.prototype, {
     }
 
     list.innerHTML = html.join('');
+    this._recordPerfMetric('renderSubagentPanel', performance.now() - perfStart, {
+      agents: sorted.length,
+      mode: 'full',
+    });
   },
 
   selectSubagent(agentId) {
@@ -2190,6 +2211,11 @@ Object.assign(CodemanApp.prototype, {
   },
 
   renderProjectInsightsPanel() {
+    this._scheduleDeferredWork('render-project-insights', () => this._renderProjectInsightsPanelImmediate(), LOW_PRIORITY_RENDER_DELAY_MS);
+  },
+
+  _renderProjectInsightsPanelImmediate() {
+    const perfStart = performance.now();
     const panel = this.$('projectInsightsPanel');
     const list = this.$('projectInsightsList');
     if (!panel || !list) return;
@@ -2200,6 +2226,10 @@ Object.assign(CodemanApp.prototype, {
     if (!showProjectInsights) {
       panel.classList.remove('visible');
       this.projectInsightsPanelVisible = false;
+      this._recordPerfMetric('renderProjectInsightsPanel', performance.now() - perfStart, {
+        tools: 0,
+        mode: 'disabled',
+      });
       return;
     }
 
@@ -2210,6 +2240,10 @@ Object.assign(CodemanApp.prototype, {
     if (runningTools.length === 0) {
       panel.classList.remove('visible');
       this.projectInsightsPanelVisible = false;
+      this._recordPerfMetric('renderProjectInsightsPanel', performance.now() - perfStart, {
+        tools: 0,
+        mode: 'empty',
+      });
       return;
     }
 
@@ -2266,6 +2300,10 @@ Object.assign(CodemanApp.prototype, {
     }
 
     list.innerHTML = html.join('');
+    this._recordPerfMetric('renderProjectInsightsPanel', performance.now() - perfStart, {
+      tools: runningTools.length,
+      mode: 'full',
+    });
   },
 
   closeProjectInsightsPanel() {
@@ -2283,6 +2321,7 @@ Object.assign(CodemanApp.prototype, {
 
   async loadFileBrowser(sessionId) {
     if (!sessionId) return;
+    const requestGeneration = ++this._fileBrowserLoadGeneration;
 
     const treeEl = this.$('fileBrowserTree');
     const statusEl = this.$('fileBrowserStatus');
@@ -2297,8 +2336,11 @@ Object.assign(CodemanApp.prototype, {
 
       const result = await res.json();
       if (!result.success) throw new Error(result.error || 'Failed to load files');
+      if (requestGeneration !== this._fileBrowserLoadGeneration || sessionId !== this.activeSessionId) return;
 
       this.fileBrowserData = result.data;
+      this._fileBrowserDataRevision += 1;
+      this._lastFileBrowserRenderSignature = '';
       this.renderFileBrowserTree();
 
       // Update status
@@ -2322,8 +2364,19 @@ Object.assign(CodemanApp.prototype, {
       return;
     }
 
+    const perfStart = performance.now();
     const html = [];
     const filter = this.fileBrowserFilter.toLowerCase();
+    const renderSignature = [
+      this.activeSessionId || '',
+      this._fileBrowserDataRevision,
+      filter,
+      this.fileBrowserAllExpanded ? '1' : '0',
+      [...this.fileBrowserExpandedDirs].sort().join('|'),
+    ].join('::');
+    if (this._lastFileBrowserRenderSignature === renderSignature && treeEl.childElementCount > 0) {
+      return;
+    }
 
     const renderNode = (node, depth) => {
       const isDir = node.type === 'directory';
@@ -2375,12 +2428,16 @@ Object.assign(CodemanApp.prototype, {
     }
 
     treeEl.innerHTML = html.join('');
+    this._lastFileBrowserRenderSignature = renderSignature;
 
-    // Add click handlers
-    treeEl.querySelectorAll('.file-tree-item').forEach(item => {
-      item.addEventListener('click', () => {
+    if (!treeEl.dataset.clickBound) {
+      treeEl.addEventListener('click', (event) => {
+        const item = event.target.closest('.file-tree-item');
+        if (!item || !treeEl.contains(item)) return;
+
         const path = item.dataset.path;
         const type = item.dataset.type;
+        if (!path) return;
 
         if (type === 'directory') {
           this.toggleFileBrowserFolder(path);
@@ -2388,6 +2445,12 @@ Object.assign(CodemanApp.prototype, {
           this.openFilePreview(path);
         }
       });
+      treeEl.dataset.clickBound = '1';
+    }
+
+    this._recordPerfMetric('renderFileBrowserTree', performance.now() - perfStart, {
+      nodes: html.length,
+      filter: filter ? 'yes' : 'no',
     });
   },
 
@@ -2410,6 +2473,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   filterFileBrowser(value) {
+    if (value === this.fileBrowserFilter) return;
     this.fileBrowserFilter = value;
     // Auto-expand all if filtering
     if (value) {
@@ -2670,26 +2734,28 @@ Object.assign(CodemanApp.prototype, {
 
       switch (data.type) {
         case 'connected':
-          body.innerHTML = '';
+          body.textContent = '';
           break;
         case 'data':
           // Append data, auto-scroll
           const wasAtBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 10;
-          const content = escapeHtml(data.content);
-          body.innerHTML += content;
+          body.append(document.createTextNode(data.content));
           if (wasAtBottom) {
             body.scrollTop = body.scrollHeight;
           }
           // Trim if too large
-          if (body.innerHTML.length > 500000) {
-            body.innerHTML = body.innerHTML.slice(-400000);
+          if (body.textContent.length > 500000) {
+            body.textContent = body.textContent.slice(-400000);
           }
           break;
         case 'end':
           this.updateLogViewerStatus(windowId, 'disconnected', 'ended');
           break;
         case 'error':
-          body.innerHTML += `<div class="log-error">${escapeHtml(data.error)}</div>`;
+          const errorEl = document.createElement('div');
+          errorEl.className = 'log-error';
+          errorEl.textContent = data.error;
+          body.append(errorEl);
           this.updateLogViewerStatus(windowId, 'error', 'error');
           break;
       }
@@ -3081,6 +3147,9 @@ Object.assign(CodemanApp.prototype, {
   },
 
   renderMonitorSubagents() {
+    const monitorPanel = document.getElementById('monitorPanel');
+    if (!monitorPanel || !monitorPanel.classList.contains('open')) return;
+
     const body = document.getElementById('monitorSubagentsBody');
     const stats = document.getElementById('monitorSubagentStats');
     if (!body) return;
@@ -3220,7 +3289,7 @@ Object.assign(CodemanApp.prototype, {
     // Poll every 2 seconds
     this.systemStatsInterval = setInterval(() => {
       this.fetchSystemStats();
-    }, 2000);
+    }, STATS_POLLING_INTERVAL_MS);
   },
 
   stopSystemStatsPolling() {
@@ -3233,12 +3302,14 @@ Object.assign(CodemanApp.prototype, {
   async fetchSystemStats() {
     // Skip polling when system stats display is hidden
     const statsEl = document.getElementById('headerSystemStats');
-    if (!statsEl || statsEl.style.display === 'none') return;
+    if (!statsEl || statsEl.style.display === 'none' || document.visibilityState === 'hidden') return;
 
     try {
+      const perfStart = performance.now();
       const res = await fetch('/api/system/stats');
       const stats = await res.json();
       this.updateSystemStatsDisplay(stats);
+      this._recordPerfMetric('fetchSystemStats', performance.now() - perfStart);
     } catch (err) {
       // Silently fail - system stats are not critical
     }
