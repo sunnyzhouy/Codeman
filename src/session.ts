@@ -847,15 +847,6 @@ export class Session extends EventEmitter {
       messageCount: this._messages.length,
       isWorking: this._isWorking,
       lastPromptTime: this._lastPromptTime,
-      // Buffer statistics for monitoring long-running sessions
-      bufferStats: {
-        terminalBufferSize: this._terminalBuffer.length,
-        textOutputSize: this._textOutput.length,
-        messageCount: this._messages.length,
-        maxTerminalBuffer: MAX_TERMINAL_BUFFER_SIZE,
-        maxTextOutput: MAX_TEXT_OUTPUT_SIZE,
-        maxMessages: MAX_MESSAGES,
-      },
       // Background task tracking (light tree strips large output strings)
       taskStats: this._taskTracker.getStats(),
       taskTree: this._taskTracker.getTaskTreeLight(),
